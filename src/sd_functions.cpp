@@ -22,6 +22,41 @@ SPIClass sdcardSPI;
 String fileToCopy;
 String fileToUse;
 
+#ifdef SD_IDF_FALLBACK
+#include <FSImpl.h>
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+
+// Arduino-ESP32 3.x sd_diskio fails to init some cards (e.g. SanDisk Ultra 32GB on
+// Cardputer ADV: f_mount FR_NOT_READY at any frequency). ESP-IDF sdspi mounts them.
+static sdmmc_card_t *s_idfCard = nullptr;
+
+// FS has no public mountpoint setter: reach FSImpl::mountpoint() through _impl.
+struct SdfsMountpointAccess : public fs::SDFS {
+    void setMp(const char *mp) { _impl->mountpoint(mp); }
+};
+
+static bool mountSdIdf(int sck, int miso, int mosi, int cs) {
+    sdcardSPI.end(); // release SPI3 after the failed Arduino attempt
+    spi_bus_config_t bus = {};
+    bus.mosi_io_num = mosi; bus.miso_io_num = miso; bus.sclk_io_num = sck;
+    bus.quadwp_io_num = -1; bus.quadhd_io_num = -1; bus.max_transfer_sz = 4096;
+    esp_err_t e = spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_CH_AUTO); // SPI2 is the display's
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return false;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI3_HOST; host.max_freq_khz = 20000;
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.gpio_cs = (gpio_num_t)cs; slot.host_id = SPI3_HOST;
+    esp_vfs_fat_sdmmc_mount_config_t cfg = {};
+    cfg.format_if_mount_failed = false; cfg.max_files = 5; cfg.allocation_unit_size = 16 * 1024;
+    e = esp_vfs_fat_sdspi_mount("/sd", &host, &slot, &cfg, &s_idfCard);
+    launcherConsolePrintln((String("SD: IDF sdspi fallback 0x") + String(e, HEX)).c_str());
+    if (e != ESP_OK) s_idfCard = nullptr;
+    return e == ESP_OK;
+}
+#endif
+
 static inline void pauseSdInstallInput() {
     if (xHandle != nullptr) vTaskSuspend(xHandle);
 }
@@ -31,6 +66,9 @@ static inline void resumeSdInstallInput() {
 }
 
 bool setupSdCard() {
+#ifdef SD_IDF_FALLBACK
+    if (s_idfCard) { sdcardMounted = true; return true; } // SDM_SD skips the sdcardMountedearly return
+#endif
 #if defined(DISABLE_SDCARD_ICON)
     // Device doesn't have SDCArd, so it may make things faster!
     sdcardMounted = false;
@@ -66,7 +104,14 @@ bool setupSdCard() {
         sdcardSPI.begin(_sck, _miso, _mosi, _cs);
         vTaskDelay(pdTICKS_TO_MS(10));
     }
-    if (sdOnTftBus ? !SDM.begin(_cs) : !SDM.begin(_cs, sdcardSPI))
+    bool sdOk = sdOnTftBus ? SDM.begin(_cs) : SDM.begin(_cs, sdcardSPI);
+#ifdef SD_IDF_FALLBACK
+    if (!sdOk && !sdOnTftBus && mountSdIdf(_sck, _miso, _mosi, _cs)) {
+        static_cast<SdfsMountpointAccess &>(SDM).setMp("/sd");
+        sdOk = true;
+    }
+#endif
+    if (!sdOk)
 #endif
     {
         // sdcardSPI.end(); // Closes SPI connections and release pin header.
